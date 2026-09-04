@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 import json
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -12,14 +13,14 @@ from agentdojo.types import (
     text_content_block_from_string,
     get_text_content_as_str,
 )
-from agentdojo.agent_pipeline.disarm.disarm_neutralize import neutralize_text
+from .disarm_neutralize import neutralize_text
 
 
 _NOISE_RE = re.compile(r"[\s\.\,\;\:\'\"\`\u2018\u2019\u201c\u201d]+")
-_YAML_WRAP_FIX_RE = re.compile(r"\n[ \t]+") 
-_YAML_DBL_QUOTE_RE = re.compile(r"''")
-_PARA_SENTINEL = "\u000b" 
-_YAML_PRETTY_INDENT_RE = re.compile(r"\n[ \t]{2,}\S") 
+_YAML_WRAP_FIX_RE = re.compile(r"\n[ \t]+")
+_YAML_DBL_QUOTE_RE = re.compile(r"''")        # YAML single-quote escape
+_PARA_SENTINEL = "\u000b"
+_YAML_PRETTY_INDENT_RE = re.compile(r"\n[ \t]{2,}\S")
 _CODE_FENCE_RE = re.compile(r"```")
 _FREE_TEXT_KEYS = {
     "body", "text", "content", "message", "prompt", "query", "description", "summary"
@@ -42,10 +43,12 @@ def _looks_like_yaml_pretty(s: str) -> bool:
     has_indent = _YAML_PRETTY_INDENT_RE.search(s) is not None
     has_yaml_quote_escape = "''" in s  # YAML single-quoted escaping
 
+    # More structure-based checks (avoid harming real paragraphs)
     lines = s.splitlines()
     if len(lines) < 2:
         return False
 
+    # Ratio of lines starting with indentation (YAML pretty often does this)
     indented_lines = sum(1 for ln in lines[1:] if ln.startswith(("  ", "\t")))
     indent_ratio = indented_lines / max(1, (len(lines) - 1))
 
@@ -53,6 +56,8 @@ def _looks_like_yaml_pretty(s: str) -> bool:
     if has_indent or has_yaml_quote_escape:
         return True
 
+    # Otherwise require "pretty-wrap like": many short-ish lines, mostly not paragraph breaks
+    # (this is weaker; keep conservative)
     avg_len = sum(len(ln) for ln in lines) / len(lines)
     has_blank_line = any(ln.strip() == "" for ln in lines)
     if indent_ratio >= 0.6 and 20 <= avg_len <= 120 and not has_blank_line:
@@ -79,7 +84,7 @@ def _maybe_fix_yaml_pretty(s: str, key: Optional[str] = None) -> str:
     if not _looks_like_yaml_pretty(s):
         return s
 
-    return _fix_yaml_pretty(s) 
+    return _fix_yaml_pretty(s)
 
 def _fix_yaml_pretty(s: str) -> str:
     if not s:
@@ -245,6 +250,38 @@ def prune_last_assistant_tool_calls_inplace(
     return False
 
 
+# def remove_last_blacklist_attempt(messages: List[ChatMessage], blacklist: Set[str]) -> List[ChatMessage]:
+#     """
+#     删除“最近一次 assistant 发出的 blacklist tool_call”以及它紧随其后的 tool 回包（若存在）。
+#     防止 dangling tool_call_id / 防止危险调用污染后续。
+#     """
+#     msgs = list(messages)
+
+#     i = len(msgs) - 1
+#     while i >= 0:
+#         m = msgs[i]
+#         if m.get("role") == "assistant" and m.get("tool_calls"):
+#             tcs = m.get("tool_calls") or []
+#             first = tcs[0] if tcs else None
+#             fn = getattr(first, "function", None)
+#             if fn in blacklist:
+#                 ids = [getattr(tc, "id", None) for tc in tcs]
+#                 ids = {str(x) for x in ids if x is not None}
+
+#                 msgs.pop(i)
+
+#                 j = i
+#                 while j < len(msgs):
+#                     mm = msgs[j]
+#                     if mm.get("role") == "tool" and str(mm.get("tool_call_id")) in ids:
+#                         msgs.pop(j)
+#                         continue
+#                     j += 1
+#                 break
+#         i -= 1
+
+#     return msgs
+
 def remove_last_unwhitelisted_attempt(messages: List[ChatMessage], whitelist: Set[str]) -> List[ChatMessage]:
     """
     Remove only the unwhitelisted tool_calls from the last assistant tool_calls message,
@@ -284,7 +321,7 @@ def remove_last_unwhitelisted_attempt(messages: List[ChatMessage], whitelist: Se
             if keep_tcs:
                 msgs[i]["tool_calls"] = keep_tcs
             else:
-                # if all tool_calls were unwhitelisted, remove the whole assistant message  
+                # if all tool_calls were unwhitelisted, remove the whole assistant message
                 msgs.pop(i)
 
             # remove only tool results for dropped ids
@@ -445,6 +482,22 @@ def replace_last_tool_call_tool_and_args_inplace(
     return False
 
 
+def replace_last_assistant_tool_calls_inplace(
+    messages: List[ChatMessage],
+    new_tool_calls: Sequence[Any],
+) -> bool:
+    """Replace the complete most-recent assistant action batch."""
+
+    if not new_tool_calls:
+        return False
+    for message in reversed(messages):
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        message["tool_calls"] = copy.deepcopy(list(new_tool_calls))
+        return True
+    return False
+
+
 def strip_last_assistant_tool_call_any_inplace(messages: List[ChatMessage], expected_tool: str) -> bool:
     """
     shadow：移除最后一条 assistant，只要它的 tool_calls 里【任意一个】匹配 expected_tool 就移除。
@@ -537,6 +590,8 @@ def _resolve_strings_via_candidates(
     skel_to_best: Dict[str, str] = {}
 
     def _skeleton_key(s: str) -> str:
+        # you can keep your existing skeleton; key only
+        # IMPORTANT: this should be derived from a trimmed view, not raw
         return _skeleton(s)
 
     for raw_c, role in candidates:
@@ -547,11 +602,11 @@ def _resolve_strings_via_candidates(
 
         cn = neutralize_text(c_trim, tool_names, source_tool) or ""
         if cn and cn != "TOOL_RESULT_OK" and cn not in norm_to_best:
-            norm_to_best[cn] = raw_c
+            norm_to_best[cn] = raw_c  # ✅ store raw
 
         cs = _skeleton_key(c_trim)
         if cs and cs not in skel_to_best:
-            skel_to_best[cs] = raw_c
+            skel_to_best[cs] = raw_c  # ✅ store raw
 
     def rec(x: Any, key: Optional[str] = None) -> Any:
         if isinstance(x, str):
@@ -616,6 +671,7 @@ __all__ = [
     "strip_last_assistant_tool_call_inplace",
     "replace_last_tool_call_args_inplace",
     "replace_last_tool_call_tool_and_args_inplace",
+    "replace_last_assistant_tool_calls_inplace",
     "strip_last_assistant_tool_call_any_inplace",
     "resolve_args_from_history",
 ]
