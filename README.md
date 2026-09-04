@@ -6,5 +6,5 @@ A training-free defense framework for indirect prompt injection in tool-augmente
 
 This repository contains the reference implementation of **DISARM**.
 
-The paper is currently under review. 
+The paper is currently under review.
 We will release full documentation, usage instructions, and reproduction scripts upon acceptance.
